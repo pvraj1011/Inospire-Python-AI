@@ -1,5 +1,9 @@
 # Legal Case-Document Entity Extraction — Methodology & Approach
 
+> 🔗 **GitHub Repository**: [https://github.com/pvraj1011/Inospire-Python-AI](https://github.com/pvraj1011/Inospire-Python-AI)  
+> 📄 **Primary Assessment Document**: `vraj.pdf` (87-page Patna High Court judgment)  
+> 🧪 **Extended Test Suite**: `TESTs/` folder (Letters Patent Appeals & Civil Writ Petitions)
+
 This document provides the architectural evaluation, implementation details, decision justifications, and benchmark metrics for the legal entity extraction pipeline developed for Indian High Court judgments, evaluated on Patna High Court matter `vraj.pdf`.
 
 ---

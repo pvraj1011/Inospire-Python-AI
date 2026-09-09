@@ -1,5 +1,7 @@
 # Legal Case-Document Entity Extraction Pipeline
 
+> 🔗 **GitHub Repository**: [https://github.com/pvraj1011/Inospire-Python-AI](https://github.com/pvraj1011/Inospire-Python-AI)
+
 Automated, deterministic, and auditable metadata extraction pipeline for Indian High Court judgments, evaluated on Patna High Court Civil Writ Jurisdiction Case orders (`vraj.pdf`) and Letters Patent Appeals (`TESTs/`).
 
 ---
