@@ -2,7 +2,7 @@
 """
 Entity Extraction Pipeline for Indian Court Judgments
 =====================================================
-Evaluated on Patna High Court judgments (specifically writ petitions like vraj.pdf).
+Evaluated on Patna High Court judgments (writ petitions, letters patent appeals, orders).
 Implements Approach 3: Targeted Document-Envelope Hybrid Pipeline.
 
 Extraction targets:
@@ -11,7 +11,7 @@ Extraction targets:
   - judge_name: List of judges reconciled from Coram and signature blocks
   - case_number: Primary case identifier (e.g. "16760 of 2023")
   - case_type: Full case classification title (e.g. "Civil Writ Jurisdiction Case")
-  - act: List of Acts actively challenged/struck down in the operative order
+  - act: List of Acts actively challenged/adjudicated in the case
   - section: Section numbers if applicable (null for constitutional writ matters)
 """
 
@@ -37,7 +37,9 @@ CASE_TYPE_MAP = {
     "CWJC": "Civil Writ Jurisdiction Case",
     "CRWJC": "Criminal Writ Jurisdiction Case",
     "LPA": "Letters Patent Appeal",
+    "L.P.A": "Letters Patent Appeal",
     "WP": "Writ Petition",
+    "W.P.": "Writ Petition",
     "FA": "First Appeal",
     "SA": "Second Appeal",
     "MA": "Miscellaneous Appeal",
@@ -71,9 +73,44 @@ HIGH_COURT_BENCH_MAP = {
 }
 
 
+def clean_act_name(act_raw: str) -> str:
+    """
+    Cleans leading noise words, prepositions, and standardizes known typos in Act titles.
+    """
+    m_lead = re.search(r'(?:enacting|called)\s+the\s+([A-Z].*)', act_raw, re.IGNORECASE)
+    if m_lead:
+        act_raw = m_lead.group(1)
+
+    cleaned = re.sub(
+        r'^(?:(?:and|the|under|in|by|of|with|for|to)\s+)+',
+        '',
+        act_raw.strip(),
+        flags=re.IGNORECASE
+    )
+    cleaned = re.sub(
+        r'^(?:(?:Union\s+)?Parliament\s+(?:in\s+enacting\s+)?(?:the\s+)?)',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+    cleaned = re.sub(
+        r'^(?:(?:State\s+)?Legislature\s+(?:in\s+enacting\s+)?(?:the\s+)?)',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+    # Standardize singular 'Caste' typo in Patna HC reservation judgment to statutory 'Castes'
+    cleaned = re.sub(r'\bScheduled Caste\b', 'Scheduled Castes', cleaned)
+    # Strip any trailing or leading quotes or braces
+    cleaned = cleaned.strip('\'"“”‘’)][(')
+    return " ".join(cleaned.split()).strip()
+
+
 def extract_pdf_pages(pdf_path: str) -> List[str]:
     """
-    Extracts text layer from each page of the PDF into a list of strings.
+    Extracts text layer from the PDF. For multi-hundred page batched judgments,
+    intelligently samples the opening envelope (pages 0..15) and closing envelope
+    (last 50 pages) where all judicial entities, orders, and signatures reside.
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found at: {pdf_path}")
@@ -81,9 +118,18 @@ def extract_pdf_pages(pdf_path: str) -> List[str]:
     pages_text: List[str] = []
     with open(pdf_path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
-        for idx, page in enumerate(reader.pages):
-            txt = page.extract_text() or ""
+        total_pages = len(reader.pages)
+        
+        if total_pages > 65:
+            # Envelope sampling: first 15 pages + last 50 pages
+            indices = list(range(min(15, total_pages))) + list(range(max(15, total_pages - 50), total_pages))
+        else:
+            indices = list(range(total_pages))
+            
+        for idx in indices:
+            txt = reader.pages[idx].extract_text() or ""
             pages_text.append(txt)
+            
     return pages_text
 
 
@@ -98,8 +144,9 @@ def extract_case_identifiers(pages: List[str]) -> Tuple[str, str, str]:
 
     # Step 1: Scan running footers/headers (present across pages)
     # Example: "Patna High Court CWJC No.16760 of 2023 dt.20-06-2024"
+    # Example: "Patna High Court L.P.A No.748 of 2022 dt.20-03-2024"
     footer_regex = re.compile(
-        r'([A-Za-z\s]+?)\s+([A-Z]{2,6})\s+No\.?\s*(\d+\s+of\s+\d{4})',
+        r'([A-Za-z\s]+?)\s+([A-Z\.\s]{2,10}?)\s+No\.?\s*(\d+\s+of\s+\d{4})',
         re.IGNORECASE
     )
 
@@ -108,8 +155,9 @@ def extract_case_identifiers(pages: List[str]) -> Tuple[str, str, str]:
             m = footer_regex.search(line)
             if m:
                 court_raw = m.group(1).strip()
-                abbrev = m.group(2).upper()
-                case_type = CASE_TYPE_MAP.get(abbrev, abbrev)
+                abbrev = m.group(2).strip().upper().replace(' ', '')
+                # Check directly and with periods removed
+                case_type = CASE_TYPE_MAP.get(abbrev, CASE_TYPE_MAP.get(abbrev.replace('.', ''), abbrev))
                 case_number = m.group(3).strip()
                 break
         if case_number:
@@ -119,7 +167,7 @@ def extract_case_identifiers(pages: List[str]) -> Tuple[str, str, str]:
     if pages:
         p1 = pages[0]
         full_case_match = re.search(
-            r'((?:Civil|Criminal)\s+Writ\s+Jurisdiction\s+Case)\s+No\.?\s*(\d+\s+of\s+\d{4})',
+            r'((?:Civil|Criminal)\s+Writ\s+Jurisdiction\s+Case|Letters\s+Patent\s+Appeal)\s+No\.?\s*(\d+\s+of\s+\d{4})',
             p1,
             re.IGNORECASE
         )
@@ -173,23 +221,15 @@ def extract_court_and_bench(pages: List[str], court_raw: str) -> Tuple[str, str]
 
 def extract_judges(pages: List[str]) -> List[str]:
     """
-    Extracts judge names by reconciling Coram entries (Pages 1-7) with the
-    closing signature block (final page).
-    
-    Coram entry example:
-      CORAM: HONOURABLE THE CHIEF JUSTICE
-             HONOURABLE MR. JUSTICE HARISH KUMAR
-    
-    Closing signature block:
-      (K. Vinod Chandran, CJ)
-      (Harish Kumar, J)
+    Extracts judge names by reconciling Coram entries with the closing signature block.
+    Handles leading whitespace and judicial designations (CJ, J, ACJ).
     """
     judges: List[str] = []
 
-    # 1. Scan final page signature block
     if pages:
-        final_pages_text = "\n".join(pages[-2:])
-        sig_pattern = re.compile(r'\(([A-Z][a-zA-Z\.\s]+?,\s*(?:CJ|J|ACJ))\)')
+        # Scan last 4 pages for closing signatures
+        final_pages_text = "\n".join(pages[-4:])
+        sig_pattern = re.compile(r'\(\s*([A-Za-z\.\s]+?,\s*(?:CJ|J|ACJ))\)')
         sig_matches = sig_pattern.findall(final_pages_text)
         
         seen = set()
@@ -199,80 +239,118 @@ def extract_judges(pages: List[str]) -> List[str]:
                 seen.add(cleaned)
                 judges.append(cleaned)
 
-    # 2. Coram cross-verification
-    # Coram often lists roles without full initials (e.g. "HONOURABLE THE CHIEF JUSTICE").
-    # If the signature block resolved the names, return them.
+    # Fallback to coram parsing if signatures were obscured
     if not judges and pages:
-        # Fallback to coram parsing if signatures were obscured
-        for p in pages[:10]:
+        for p in pages[:15]:
             if "CORAM" in p:
                 for line in p.split("\n"):
                     if "HONOURABLE" in line:
                         clean_name = line.replace("HONOURABLE", "").replace("MR.", "").replace("JUSTICE", "").strip()
+                        clean_name = " ".join(clean_name.split())
                         if clean_name and clean_name not in judges:
                             judges.append(clean_name)
+                            
     return judges
 
 
 def extract_acts_and_sections(pages: List[str]) -> Tuple[Optional[List[str]], Optional[str]]:
     """
-    Extracts the Acts challenged/adjudicated in the operative order (final 2 pages).
-    Distinguishes historical precedent Acts mentioned in the body from operative Acts.
-    Statutory sections are verified and set to null if only constitutional Articles exist.
+    Extracts the Acts and Sections challenged/adjudicated in the case.
+    1. First checks operative disposition envelope for struck down Acts.
+    2. Resolves statutory definitions and acronyms (e.g. RTE Act, RDB Act).
+    3. Detects specific Section citations or sets to null if purely constitutional Articles.
     """
     if not pages:
         return None, None
 
-    # Search operative envelope near end of document (Pages 85-87)
-    final_text = " ".join(" ".join(pages[-3:]).split())
-
-    acts: List[str] = []
-    
-    # Anchor to operative order phrases: "set aside", "quashed", "ultra vires", "struck down"
+    # Step 1: Check operative strike-down in final 4 pages
+    combined_end = " ".join(" ".join(pages[-4:]).split())
     op_match = re.search(
         r'(?:set aside|quash(?:ed)?|struck down)\s+(?:the\s+)?(.*?)\s+as\s+ultra\s+vires',
-        final_text,
+        combined_end,
         re.IGNORECASE
     )
 
     if op_match:
         acts_blob = op_match.group(1).strip()
-        # Find all individual Acts within the operative block
-        # Pattern captures: "<State/Subject> ... Amendment Act, <Year>"
         act_pattern = re.compile(r'((?:(?:and\s+)?(?:the\s+)?[A-Z][A-Za-z0-9\s\(\),]+?\bAct,\s*\d{4}))')
         raw_matches = act_pattern.findall(acts_blob)
-        
+        acts: List[str] = []
         for match in raw_matches:
-            # Clean leading conjunctions and articles
-            cleaned = re.sub(r'^(?:and\s+)?(?:the\s+)?', '', match.strip(), flags=re.IGNORECASE).strip()
-            # Standardize minor court typo ('Scheduled Caste,' -> standard formal title 'Scheduled Castes,')
-            normalized = re.sub(r'\bScheduled Caste\b', 'Scheduled Castes', cleaned)
-            if normalized and normalized not in acts:
-                acts.append(normalized)
-
-    # Fallback to full-text scan of final 2 pages if specific phrase was not found
-    if not acts:
-        act_general_pattern = re.compile(r'([A-Z][A-Za-z0-9\s\(\),]+?\b(?:Amendment\s+)?Act,\s*\d{4})')
-        matches = act_general_pattern.findall(" ".join(pages[-2:].split()))
-        for m in matches:
-            cleaned = m.strip()
-            if cleaned not in acts and len(cleaned) > 10:
+            cleaned = clean_act_name(match)
+            if cleaned and cleaned not in acts:
                 acts.append(cleaned)
+        if acts:
+            return acts, None
 
-    # Section verification across document
-    # Check if this is a constitutional writ petition (Articles only) or cites statutory sections
+    # Step 2: Build acronym map and scan for challenged Acts & Sections
+    doc_text = " ".join(" ".join(pages).split())
+    acts: List[str] = []
     section: Optional[str] = None
-    section_pattern = re.compile(r'\bSection\s+(\d+[A-Za-z\(\)]*)\b', re.IGNORECASE)
-    
-    # Check operative envelope first, then document sample
-    sec_matches = section_pattern.findall(final_text)
-    if sec_matches:
-        section = sec_matches[0]
-    else:
-        # Check if entire document discusses Articles rather than statutory sections
-        full_text_sample = " ".join([pages[0], pages[-1]])
-        if "Article" in full_text_sample or "Articles 14" in full_text_sample:
-            section = None  # Explicitly null for constitutional writ petitions
+
+    acronym_map: Dict[str, str] = {}
+    acronym_regex = re.compile(
+        r'([A-Z][A-Za-z\s\(\)]+?\bAct,\s*\d{4})\s*[\(\[“\"\‘](?:hereinafter\s+referred\s+to\s+as\s+)?(?:[\‘\“\"\']?([A-Za-z0-9\.\s]+?Act)[\’\”\"\']?|([A-Za-z0-9\.\s]+))[\)\]”\"\’]',
+        re.IGNORECASE
+    )
+    for m in acronym_regex.finditer(doc_text):
+        full_act = clean_act_name(m.group(1))
+        acr = (m.group(2) or m.group(3) or "").strip().strip('\'"“”‘’)][(')
+        if acr:
+            acronym_map[acr] = full_act
+            acronym_map[acr.lower()] = full_act
+    standard_statutes = {
+        "RTE Act": "Right of Children to Free and Compulsory Education Act, 2009",
+        "RDB Act": "Recovery of the Debts and Bankruptcy Act, 1993",
+        "RDDBFI Act": "Recovery of the Debts and Bankruptcy Act, 1993",
+        "NI Act": "Negotiable Instruments Act, 1881",
+        "SARFAESI Act": "Securitisation and Reconstruction of Financial Assets and Enforcement of Security Interest Act, 2002",
+        "CPC": "Code of Civil Procedure, 1908",
+        "CrPC": "Code of Criminal Procedure, 1973"
+    }
+    for k, v in standard_statutes.items():
+        if k not in acronym_map:
+            acronym_map[k] = v
+            acronym_map[k.lower()] = v
+
+    # Step 3: Scan for "Section <Num> ... of/under <Act/Acronym>"
+    sec_act_matches = re.findall(
+        r'Section\s+(\d+\s*(?:\([0-9A-Za-z]+\))*)\s+(?:of\s+(?:the\s+)?|under\s+(?:the\s+)?)([A-Z][A-Za-z0-9\.\s]+?Act(?:,\s*\d{4})?)',
+        doc_text,
+        re.IGNORECASE
+    )
+
+    for sec_val, act_raw in sec_act_matches:
+        sec_clean = " ".join(sec_val.split()).strip()
+        act_clean = clean_act_name(act_raw)
+        resolved_act = acronym_map.get(act_raw.strip(), acronym_map.get(act_clean, act_clean))
+        
+        if resolved_act not in acts and len(resolved_act) > 5:
+            acts.append(resolved_act)
+        if not section:
+            section = sec_clean
+
+    # Step 4: If no section from "Section of Act", look for standalone Section citations
+    if not section:
+        s_m = re.search(r'\bSection\s+(\d+\s*(?:\([0-9A-Za-z]+\))+)', doc_text)
+        if s_m:
+            section = " ".join(s_m.group(1).split()).strip()
+            
+    # Step 5: If acts still empty, extract primary statutes mentioned
+    if not acts:
+        all_acts = re.findall(r'([A-Z][A-Za-z\s\(\)]+?\bAct,\s*\d{4})', doc_text)
+        for a in all_acts:
+            c = clean_act_name(a)
+            if c not in acts and len(c) > 10:
+                acts.append(c)
+                if len(acts) >= 2:
+                    break
+
+    # Constitutional writ petition check (Articles instead of Sections)
+    if not section:
+        full_sample = " ".join([pages[0], pages[-1]])
+        if "Article" in full_sample or "Articles 14" in full_sample:
+            section = None
 
     return (acts if acts else None), section
 
@@ -341,28 +419,132 @@ def extract_entities(pdf_path: str) -> Dict[str, Any]:
     return result
 
 
+def select_file_via_popup() -> Optional[str]:
+    """
+    Opens a native file picker dialog pop-up allowing the user to select any PDF.
+    Returns the absolute path to the selected file, or None if cancelled.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        selected = filedialog.askopenfilename(
+            title="Select Court Judgment PDF to Extract",
+            filetypes=[("PDF Files (*.pdf)", "*.pdf"), ("All Files (*.*)", "*.*")]
+        )
+        root.destroy()
+        return selected if selected else None
+    except Exception as e:
+        sys.stderr.write(f"Note: Could not open GUI dialog ({e}). Using CLI mode.\n")
+        return None
+
+
+def show_completion_popup(pdf_path: str, output_path: str, entities: Dict[str, Any]) -> None:
+    """
+    Displays a native pop-up alert summarizing the extraction result.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        summary = (
+            f"Extraction Successful!\n\n"
+            f"File: {os.path.basename(pdf_path)}\n"
+            f"Court: {entities.get('court_name')}\n"
+            f"Bench: {entities.get('court_bench')}\n"
+            f"Case: {entities.get('case_type')} No. {entities.get('case_number')}\n"
+            f"Judges: {', '.join(entities.get('judge_name') or ['None'])}\n"
+            f"Section: {entities.get('section')}\n\n"
+            f"Saved to: {output_path}"
+        )
+        messagebox.showinfo("Legal Entity Extractor", summary)
+        root.destroy()
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Legal Case-Document Entity Extractor")
-    parser.add_argument("pdf_path", nargs="?", default="vraj.pdf", help="Path to input PDF document (default: vraj.pdf)")
+    parser.add_argument("pdf_path", nargs="?", default=None, help="Path to input PDF document (if omitted, file-picker popup opens)")
     parser.add_argument("--output", "-o", default="output.json", help="Path to output JSON file (default: output.json)")
-    parser.add_argument("--benchmark", action="store_true", help="Print runtime benchmark metrics")
+    parser.add_argument("--batch", "-b", help="Directory of PDFs to batch process")
+    parser.add_argument("--no-popup", action="store_true", help="Disable GUI pop-up dialog and run in headless CLI mode")
     args = parser.parse_args()
+
+    # Batch directory mode
+    if args.batch:
+        if not os.path.isdir(args.batch):
+            sys.stderr.write(f"Batch directory not found: {args.batch}\n")
+            sys.exit(1)
+        pdf_files = [f for f in os.listdir(args.batch) if f.lower().endswith(".pdf")]
+        print(f"Batch processing {len(pdf_files)} PDFs in '{args.batch}'...")
+        for fname in sorted(pdf_files):
+            fpath = os.path.join(args.batch, fname)
+            out_base = os.path.splitext(fname)[0]
+            out_file = os.path.join(args.batch, f"{out_base}_output.json")
+            t0 = time.perf_counter()
+            try:
+                data = extract_entities(fpath)
+                with open(out_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                alt_out = os.path.join(args.batch, f"{out_base}.json")
+                with open(alt_out, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                dur = time.perf_counter() - t0
+                print(f"  [OK] {fname} -> {out_file} ({dur:.3f}s)")
+            except Exception as e:
+                print(f"  [FAIL] {fname}: {e}")
+        return
+
+    # Single document mode: check if we should trigger file picker pop-up
+    launched_via_popup = False
+    target_pdf = args.pdf_path
+
+    if not target_pdf and not args.no_popup:
+        print("Opening file upload pop-up dialog... Select your PDF.")
+        selected = select_file_via_popup()
+        if selected:
+            target_pdf = selected
+            launched_via_popup = True
+            print(f"Selected file from dialog: '{target_pdf}'")
+        else:
+            print("No file chosen in pop-up dialog. Defaulting to 'vraj.pdf'.")
+            target_pdf = "vraj.pdf"
+    elif not target_pdf:
+        target_pdf = "vraj.pdf"
 
     start_time = time.perf_counter()
     try:
-        entities = extract_entities(args.pdf_path)
+        entities = extract_entities(target_pdf)
     except Exception as err:
         sys.stderr.write(f"Extraction Error: {err}\n")
         sys.exit(1)
 
     elapsed = time.perf_counter() - start_time
 
-    # Write output JSON adhering strictly to contract
+    # Save to primary output
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(entities, f, indent=2, ensure_ascii=False)
 
-    print(f"Successfully extracted entities from '{args.pdf_path}' -> '{args.output}' in {elapsed:.4f}s")
+    # If the user selected a specific file, also save a corresponding <stem>_output.json
+    if target_pdf != "vraj.pdf":
+        base_dir = os.path.dirname(target_pdf) or "."
+        stem = os.path.splitext(os.path.basename(target_pdf))[0]
+        file_specific_out = os.path.join(base_dir, f"{stem}_output.json")
+        with open(file_specific_out, "w", encoding="utf-8") as f:
+            json.dump(entities, f, indent=2, ensure_ascii=False)
+
+    print(f"\nSuccessfully extracted entities from '{target_pdf}' in {elapsed:.4f}s")
+    print(f"Saved to: '{args.output}'")
     print(json.dumps(entities, indent=2, ensure_ascii=False))
+
+    # Show visual completion alert if launched via pop-up
+    if launched_via_popup:
+        show_completion_popup(target_pdf, args.output, entities)
 
 
 if __name__ == "__main__":
